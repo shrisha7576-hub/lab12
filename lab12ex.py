@@ -1,294 +1,221 @@
 """
 ISOM3400 Business Applications Development in Python
-Individual Assignment: Wikipedia Article Extractor (logic layer)
-Filename: wikipedia_extractor_core.py
+Wikipedia Article Extractor - Streamlit UI (search, select, extract, preview, download)
 
-Pure logic for the Streamlit web app. This module contains NO calls to
-input() or print(). The UI layer is responsible for all user interaction
-and for delivering the report (e.g. via st.download_button).
-
-Requires:  requests, beautifulsoup4
+Wires WikipediaExtractor (from wikipedia_extractor_core.py) into the UI.
+Run with:  streamlit run lab12ex.py
 """
 
 import re
-import textwrap
-from datetime import datetime
-from urllib.parse import quote, unquote
 
-import requests
-from bs4 import BeautifulSoup, Tag
+import streamlit as st
 
+from wikipedia_extractor_core import (
+    DisambiguationError,
+    WikipediaError,
+    WikipediaExtractor,
+    format_txt,
+    numbered_filename,
+    safe_filename,
+    validate_topic,
+)
 
-# ============================================================================
-# Custom Exceptions
-# ============================================================================
-class WikipediaError(Exception):
-    """Base exception for Wikipedia extractor errors."""
+# Must be the first Streamlit call in the script.
+st.set_page_config(page_title="Wikipedia Extractor", layout="wide")
 
+# ----------------------------------------------------------------------------
+# Session state defaults (only set if the key is not already present)
+# ----------------------------------------------------------------------------
+DEFAULTS = {
+    "topic": None,
+    "article": None,
+    "titles": [],
+    "selected": [],
+    "sections": [],
+    "suggestions": [],
+    "saved_path": None,
+    "pending_overwrite": None,
+    "pending_filename": None,
+    "downloaded_filenames": [],
+}
+for key, default in DEFAULTS.items():
+    if key not in st.session_state:
+        st.session_state[key] = list(default) if isinstance(default, list) else default
 
-class ArticleNotFoundError(WikipediaError):
-    """Raised when no matching Wikipedia article is found."""
+# Robustness guard: reset stale state if article is missing while titles/sections exist
+if st.session_state.article is None and (st.session_state.titles or st.session_state.sections):
+    st.session_state.titles = []
+    st.session_state.selected = []
+    st.session_state.sections = []
+    st.session_state.downloaded_filenames = []
+    st.rerun()
 
+# ----------------------------------------------------------------------------
+# Sidebar
+# ----------------------------------------------------------------------------
+with st.sidebar:
+    st.header("Wikipedia Extractor")
+    if st.button("Start Over"):
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
 
-class DisambiguationError(WikipediaError):
-    """Raised when a topic matches a disambiguation page."""
+# ----------------------------------------------------------------------------
+# Main area
+# ----------------------------------------------------------------------------
+st.title("Wikipedia Article Extractor")
 
-    def __init__(self, message, suggestions=None):
-        super().__init__(message)
-        self.suggestions = suggestions or []
+with st.expander("How to use this app"):
+    st.markdown(
+        "1. Enter a topic in the search box and click **Search**.\n"
+        "2. Select one or more sections from the multiselect.\n"
+        "3. Click **Extract** to preview the selected content.\n"
+        "4. Click **Download .txt** to save the report to your device."
+    )
 
+# Progress indicator
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    st.caption(f"{'✅' if st.session_state.topic else '⬜'} Search")
+with col2:
+    st.caption(f"{'✅' if st.session_state.titles else '⬜'} Select")
+with col3:
+    st.caption(f"{'✅' if st.session_state.sections else '⬜'} Extract")
+with col4:
+    st.caption(f"{'✅' if st.session_state.downloaded_filenames else '⬜'} Download")
 
-class FetchError(WikipediaError):
-    """Raised on network or HTTP errors."""
+with st.form("topic_form"):
+    topic_input = st.text_input("Enter a topic")
+    submitted = st.form_submit_button("Search")
 
+# ----------------------------------------------------------------------------
+# Stage 1 - Search submit handler
+# ----------------------------------------------------------------------------
+input_error = None
+if submitted:
+    topic = topic_input.strip()
 
-class ParseError(WikipediaError):
-    """Raised when article HTML cannot be parsed as expected."""
+    # Every new search starts from a clean slate.
+    st.session_state.article = None
+    st.session_state.titles = []
+    st.session_state.selected = []
+    st.session_state.sections = []
+    st.session_state.suggestions = []
 
+    input_error = validate_topic(topic)
+    if input_error is None:
+        st.session_state.topic = topic
+        extractor = WikipediaExtractor(topic)
+        with st.spinner(f"Searching Wikipedia for '{topic}'..."):
+            try:
+                extractor.fetch_and_parse()
+            except DisambiguationError as exc:
+                st.session_state.suggestions = list(exc.suggestions)
+            except WikipediaError:
+                pass  # Error message is already stored in extractor.error
+        st.session_state.article = extractor
+        if not extractor.error:
+            st.session_state.titles = [sec["title"] for sec in extractor.sections]
 
-# ============================================================================
-# WikipediaExtractor Class
-# ============================================================================
-class WikipediaExtractor:
-    """Fetches, parses, and formats sections from an English Wikipedia article."""
+# Placeholder sections
+article_info_area = st.container()      # article title, URL, errors
+section_select_area = st.container()    # section multiselect
+extract_area = st.container()           # Extract button
+preview_area = st.container()           # report preview
+download_area = st.container()          # download button
 
-    BASE_URL = "https://en.wikipedia.org/wiki/"
-    SEARCH_URL = "https://en.wikipedia.org/wiki/Special:Search"
-    HEADERS = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36 ISOM3400Assignment/1.0"
+article = st.session_state.article
+
+with article_info_area:
+    if input_error:
+        st.error(input_error)
+    elif article is not None and article.error:
+        st.error(article.error)
+        if st.session_state.suggestions:
+            st.write("Try one of these specific topics:")
+            for item in st.session_state.suggestions:
+                st.markdown(f"- {item}")
+    elif article is not None:
+        st.success(
+            f"Article found: {article.article_title} "
+            f"({len(st.session_state.titles)} sections available)"
         )
-    }
-    TIMEOUT = 10
-    WRAP_WIDTH = 88
+        st.write(article.url)
 
-    IGNORED_TITLES = {
-        "contents", "see also", "references", "external links",
-        "further reading", "notes", "notes and references", "footnotes",
-        "navigation menu", "bibliography", "sources", "citations",
-    }
-
-    JUNK_SELECTORS = [
-        "sup.reference", "sup.noprint", "span.mw-editsection", "style", "script",
-        "figure", "div.thumb", "div.navbox", "div.hatnote", "div.reflist",
-        "div.refbegin", "div.toc", "div#toc", "div.sidebar",
-        "div.shortdescription", "div.metadata", "span.noprint", "div.gallery",
-        "div.mw-references-wrap", "ol.references", "span[style*='display:none']",
-    ]
-
-    def __init__(self, topic: str):
-        self.error = None  # Last error message (str) set by fetch_and_parse, else None
-        self.topic = topic.strip()
-        self.url = ""
-        self.soup = None
-        self.article_title = ""
-        self.sections = []  # List of dicts: {"id": int, "title": str, "lines": list[str]}
-
-    def _get(self, url, params=None):
-        """Perform an HTTP GET and translate request errors into FetchError."""
-        try:
-            return requests.get(
-                url,
-                params=params,
-                headers=self.HEADERS,
-                timeout=self.TIMEOUT,
-            )
-        except requests.exceptions.Timeout:
-            raise FetchError("Request timed out while connecting to Wikipedia.")
-        except requests.exceptions.ConnectionError:
-            raise FetchError("Network connection error. Please check your internet connection.")
-        except requests.exceptions.RequestException as exc:
-            raise FetchError(f"Network error: {exc}") from exc
-
-    def _download(self):
-        """Download the Wikipedia article, falling back to Go search for casing/redirects."""
-        slug = quote(self.topic.replace(" ", "_"))
-        response = self._get(self.BASE_URL + slug)
-
-        if response.status_code == 404:
-            response = self._get(
-                self.SEARCH_URL,
-                params={"search": self.topic, "go": "Go"},
-            )
-            if "Special:Search" in unquote(response.url):
-                raise ArticleNotFoundError(
-                    f"Article not found for '{self.topic}'. Please check spelling or try another topic."
-                )
-
-        if response.status_code == 429:
-            raise FetchError("Wikipedia rate limit reached (HTTP 429). Please wait and try again.")
-
-        try:
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as exc:
-            raise FetchError(f"Wikipedia returned HTTP status {response.status_code}.") from exc
-
-        return response
-
-    def fetch_and_parse(self):
-        """
-        Fetch the article HTML and parse top-level sections.
-
-        On failure the message is stored in self.error and the original
-        WikipediaError subclass is re-raised so the UI can choose how to react.
-        """
-        self.error = None
-        try:
-            self._fetch_and_parse()
-        except WikipediaError as exc:
-            self.error = str(exc)
-            raise
-
-    def _fetch_and_parse(self):
-        response = self._download()
-        response.encoding = "utf-8"
-        self.url = response.url
-
-        self.soup = BeautifulSoup(response.text, "html.parser")
-        heading = self.soup.find("h1", id="firstHeading")
-        self.article_title = (
-            heading.get_text(strip=True) if heading else self.topic.title()
-        )
-
-        if self.soup.find("div", id="mw-content-text") is None:
-            raise ParseError("Could not locate main article content on the page.")
-
-        self._check_disambiguation()
-
-        try:
-            self._parse_sections()
-        except Exception as exc:
-            raise ParseError(f"Failed to parse article structure ({exc}).") from exc
-
-        if not self.sections:
-            raise ParseError("No readable sections found on this article.")
-
-    def _check_disambiguation(self):
-        """Raise DisambiguationError if the page is a disambiguation page."""
-        is_disambig = self.soup.select_one("#disambigbox, .dmbox-disambig") is not None
-        if not is_disambig:
-            catlinks = self.soup.find("div", id="mw-normal-catlinks")
-            if catlinks is not None:
-                is_disambig = any(
-                    a.get_text(strip=True).lower().endswith("disambiguation pages")
-                    for a in catlinks.find_all("a")
-                )
-        if is_disambig:
-            raise DisambiguationError(
-                f"'{self.topic}' is a disambiguation page with multiple possible articles.",
-                self._disambiguation_suggestions(),
+# ----------------------------------------------------------------------------
+# Stage 2 & 3 - Select and Extract
+# ----------------------------------------------------------------------------
+if article is not None and not article.error and st.session_state.titles:
+    if len(st.session_state.titles) <= 1:
+        st.warning("No usable sections found to extract for this topic.")
+    else:
+        with section_select_area:
+            st.session_state.selected = st.multiselect(
+                "Select sections to extract",
+                options=st.session_state.titles,
+                default=st.session_state.selected,
             )
 
-    def _disambiguation_suggestions(self, limit=6):
-        """Return up to `limit` suggested article titles from a disambiguation page."""
-        suggestions = []
-        content = self.soup.find("div", id="mw-content-text")
-        if content is None:
-            return suggestions
-        for li in content.find_all("li"):
-            link = li.find("a", href=True)
-            title = link.get("title", "").strip() if link else ""
-            if title and ":" not in title and title not in suggestions:
-                suggestions.append(title)
-            if len(suggestions) >= limit:
-                break
-        return suggestions
+        with extract_area:
+            if st.button("Extract"):
+                if not st.session_state.selected:
+                    st.warning("Please select at least one section before extracting.")
+                else:
+                    st.session_state.sections = [
+                        article.sections[st.session_state.titles.index(title)]
+                        for title in st.session_state.selected
+                    ]
 
-    @staticmethod
-    def _clean_text(text: str) -> str:
-        """Remove citation markers like [1] or [citation needed] and normalize spacing."""
-        cleaned = re.sub(
-            r"\[\s*(\d+\vert{}citation needed\vert{}note \d+\vert{}[a-z])\s*\]",
-            "",
-            text,
-            flags=re.IGNORECASE,
+# ----------------------------------------------------------------------------
+# Stage 4 - Preview
+# ----------------------------------------------------------------------------
+if st.session_state.sections and article is not None and not article.error:
+    with preview_area:
+        with st.container(border=True):
+            for sec in st.session_state.sections:
+                st.markdown(f"### {sec['id']}. {sec['title']}")
+                body = re.sub(r"\n{3,}", "\n\n", "\n".join(sec["lines"]).strip())
+                if body:
+                    st.text(body)
+                else:
+                    st.caption("(no extractable content)")
+
+    # ------------------------------------------------------------------------
+    # Download flow (in-memory string + session collision check)
+    # ------------------------------------------------------------------------
+    with download_area:
+        base_name = safe_filename(article.article_title)
+        has_collision = base_name in st.session_state.downloaded_filenames
+        if has_collision:
+            st.warning(
+                "You already downloaded a file with this name in this session. "
+                "Downloading again will add (2) to the name."
+            )
+        final_filename = numbered_filename(
+            base_name, st.session_state.downloaded_filenames
         )
-        cleaned = re.sub(r"\s+", " ", cleaned)
-        return cleaned.strip()
+        report_content = format_txt(
+            article.article_title,
+            article.url,
+            st.session_state.sections,
+        )
 
-    @staticmethod
-    def _heading_level(node):
-        """Return heading level 2..6 for h2-h6 or mw-heading wrappers, else None."""
-        if not isinstance(node, Tag):
-            return None
-        if re.fullmatch(r"h[2-6]", node.name or ""):
-            return int(node.name[1])
-        if node.name == "div" and "mw-heading" in node.get("class", []):
-            inner = node.find(re.compile(r"^h[2-6]$"))
-            if inner:
-                return int(inner.name[1])
-        return None
+        def _record_download(fname=final_filename):
+            st.session_state.downloaded_filenames.append(fname)
+            st.session_state.saved_path = fname
 
-    @staticmethod
-    def _heading_text(node) -> str:
-        """Extract clean heading text without edit links."""
-        heading = node if re.fullmatch(r"h[2-6]", node.name or "") else node.find(re.compile(r"^h[2-6]$"))
-        for edit_span in heading.select("span.mw-editsection"):
-            edit_span.decompose()
-        return WikipediaExtractor._clean_text(heading.get_text())
+        st.download_button(
+            label="Download .txt",
+            data=report_content,
+            file_name=final_filename,
+            mime="text/plain",
+            key="download_btn",
+            on_click=_record_download,
+        )
 
-    def _list_to_lines(self, list_node, depth=0) -> list:
-        """Convert <ul> or <ol> elements (including nested lists) into wrapped lines."""
-        lines = []
-        is_ordered = list_node.name == "ol"
-        indent = "    " * depth
-        for idx, li in enumerate(list_node.find_all("li", recursive=False), start=1):
-            parts = []
-            for child in li.children:
-                if isinstance(child, Tag) and child.name in ("ul", "ol"):
-                    continue
-                parts.append(child.get_text() if isinstance(child, Tag) else str(child))
-            item_text = self._clean_text("".join(parts))
-            bullet = f"{idx}." if is_ordered else "-"
-            if item_text:
-                lines.append(
-                    textwrap.fill(
-                        f"{bullet} {item_text}",
-                        self.WRAP_WIDTH,
-                        initial_indent=indent + "  ",
-                        subsequent_indent=indent + "    ",
-                    )
-                )
-            for sub_list in li.find_all(["ul", "ol"], recursive=False):
-                lines.extend(self._list_to_lines(sub_list, depth + 1))
-        return lines
+st.caption("Content from Wikipedia, CC BY-SA 4.0.")
 
-    def _table_to_lines(self, table) -> list:
-        """Convert a data table into readable ' | ' separated rows."""
-        rows = []
-        for tr in table.find_all("tr"):
-            if tr.find_parent("table") is not table:
-                continue
-            cells = [
-                self._clean_text(cell.get_text())
-                for cell in tr.find_all(["th", "td"], recursive=False)
-            ]
-            if any(cells):
-                rows.append(" | ".join(cells))
-        if not rows:
-            return []
-        caption = table.find("caption")
-        caption_text = self._clean_text(caption.get_text()) if caption else ""
-        label = f"[Table: {caption_text}]" if caption_text else "[Table]"
-        return [label] + rows
-
-    def _walk(self, parent):
-        """Yield headings and content blocks in document order."""
-        for node in parent.children:
-            if not isinstance(node, Tag):
-                continue
-            if self._heading_level(node) is not None:
-                yield node
-            elif node.name in ("p", "ul", "ol", "dl", "blockquote"):
-                yield node
-            elif node.name == "table" and "wikitable" in node.get("class", []):
-                yield node
-            elif node.name in ("div", "section", "article", "main"):
-                yield from self._walk(node)
-
-    def _add_section(self, title: str, lines: list, collecting: bool):
-        """Append a non-ignored, non-empty section to self.sections."""
-        if collecting and any(line.strip() for line in lines):
-            self.sections.append(
+# ----------------------------------------------------------------------------
+# Debug
+# ----------------------------------------------------------------------------
+st.write(st.session_state)
