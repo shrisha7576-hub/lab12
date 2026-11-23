@@ -4,7 +4,7 @@ Wikipedia Article Extractor - Streamlit UI (search, select, extract, preview)
 
 Wires WikipediaExtractor (from wikipedia_extractor_core.py) into the UI.
 The download button is not added yet.
-Run with:  streamlit run app.py
+Run with:  streamlit run lab12ex.py
 """
 
 import re
@@ -29,6 +29,7 @@ DEFAULTS = {
     "article": None,
     "titles": [],
     "selected": [],
+    "selected_indices": [],
     "sections": [],
     "suggestions": [],
     "saved_path": None,
@@ -71,23 +72,25 @@ if submitted:
     st.session_state.article = None
     st.session_state.titles = []
     st.session_state.selected = []
+    st.session_state.selected_indices = []
     st.session_state.sections = []
     st.session_state.suggestions = []
 
     input_error = validate_topic(topic)
     if input_error is None:
         st.session_state.topic = topic
-        article = WikipediaExtractor(topic)
+        extractor = WikipediaExtractor(topic)
         with st.spinner(f"Searching Wikipedia for '{topic}'..."):
             try:
-                article.fetch_and_parse()
+                extractor.fetch_and_parse()
             except DisambiguationError as exc:
                 st.session_state.suggestions = list(exc.suggestions)
             except WikipediaError:
-                pass  # The message is already stored in article.error
-        st.session_state.article = article
-        if not article.error:
-            st.session_state.titles = [sec["title"] for sec in article.sections]
+                pass  # Error message is already stored in extractor.error
+
+        st.session_state.article = extractor
+        if not extractor.error:
+            st.session_state.titles = [sec["title"] for sec in extractor.sections]
 
 # Placeholder sections
 article_info_area = st.container()      # article title, URL, errors
@@ -117,7 +120,7 @@ with article_info_area:
 # ----------------------------------------------------------------------------
 # Stage 2 - Select
 # ----------------------------------------------------------------------------
-if st.session_state.titles:
+if article is not None and not article.error and st.session_state.titles:
     with section_select_area:
         st.session_state.selected = st.multiselect(
             "Select sections to extract",
@@ -132,12 +135,16 @@ if st.session_state.titles:
         if st.button("Extract"):
             if not st.session_state.selected:
                 st.warning("Please select at least one section before extracting.")
+                st.session_state.selected_indices = []
+                st.session_state.sections = []
             else:
-                # Section ids are 1-based positions, as used in the report.
-                st.session_state.sections = [
-                    article.sections[st.session_state.titles.index(title)]
-                    for title in st.session_state.selected
+                # Preserve original section order and 1-based section ids.
+                selected_set = set(st.session_state.selected)
+                chosen_sections = [
+                    sec for sec in article.sections if sec["title"] in selected_set
                 ]
+                st.session_state.sections = chosen_sections
+                st.session_state.selected_indices = [sec["id"] for sec in chosen_sections]
 
 # ----------------------------------------------------------------------------
 # Stage 4 - Preview
